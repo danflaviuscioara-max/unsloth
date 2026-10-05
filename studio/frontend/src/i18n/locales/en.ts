@@ -519,6 +519,8 @@ export const en = {
       search: "Search",
       projects: "Projects",
       library: "Library",
+      swarms: "Swarms",
+      skills: "Skills",
       hub: "Model hub",
       train: "Train",
       recipes: "Recipes",

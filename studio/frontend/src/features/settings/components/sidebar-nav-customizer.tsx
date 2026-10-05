@@ -11,6 +11,8 @@ import {
   Folder01Icon,
   Image03Icon,
   LibrariesIcon,
+  AiNetworkIcon,
+  PuzzleIcon,
   MoreHorizontalIcon,
   PencilEdit02Icon,
   ApiIcon,
@@ -37,6 +39,8 @@ const ITEM_META: Record<
 > = {
   projects: { icon: Folder01Icon, labelKey: "shell.navigation.projects" },
   library: { icon: LibrariesIcon, labelKey: "shell.navigation.library" },
+  swarms: { icon: AiNetworkIcon, labelKey: "shell.navigation.swarms" },
+  skills: { icon: PuzzleIcon, labelKey: "shell.navigation.skills" },
   hub: { icon: DashboardCircleIcon, labelKey: "shell.navigation.hub" },
   images: { icon: Image03Icon, labelKey: "shell.navigation.images" },
   train: { icon: TestTubeOutlineIcon, labelKey: "shell.navigation.train" },

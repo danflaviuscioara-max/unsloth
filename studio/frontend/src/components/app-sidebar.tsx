@@ -113,6 +113,8 @@ import {
   Image03Icon,
   InformationCircleIcon,
   LibrariesIcon,
+  AiNetworkIcon,
+  PuzzleIcon,
   Logout05Icon,
   MoreHorizontalIcon,
   MoreVerticalIcon,
@@ -2745,6 +2747,30 @@ export function AppSidebar() {
       },
       onIntent: () => {
         preloadSilently(router.preloadRoute({ to: "/library" }));
+      },
+    },
+    swarms: {
+      icon: AiNetworkIcon,
+      label: t("shell.navigation.swarms"),
+      active: pathname === "/swarms",
+      onClick: () => {
+        navigateFromRow({ to: "/swarms" });
+        closeMobileIfOpen();
+      },
+      onIntent: () => {
+        preloadSilently(router.preloadRoute({ to: "/swarms" }));
+      },
+    },
+    skills: {
+      icon: PuzzleIcon,
+      label: t("shell.navigation.skills"),
+      active: pathname === "/skills",
+      onClick: () => {
+        navigateFromRow({ to: "/skills" });
+        closeMobileIfOpen();
+      },
+      onIntent: () => {
+        preloadSilently(router.preloadRoute({ to: "/skills" }));
       },
     },
     hub: {

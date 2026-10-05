@@ -95,6 +95,8 @@ export const SIDEBAR_NAV_ITEM_IDS = [
   "hub",
   "projects",
   "library",
+  "swarms",
+  "skills",
   "images",
   // Video and Audio sit directly under Images: the media tabs read as one group.
   "video",
@@ -144,6 +146,8 @@ export const SIDEBAR_NAV_DEFAULT_PINNED: Record<SidebarNavItemId, boolean> = {
   hub: true,
   projects: true,
   library: true,
+  swarms: true,
+  skills: true,
   images: true,
   video: false,
   audio: false,
@@ -415,10 +419,16 @@ function sanitizeSidebarNav(value: unknown): SidebarNavItemPref[] {
     seen.add(source.id);
     items.push({ id: source.id, pinned: source.pinned !== false });
   }
-  // Ids added after the payload was written land at the end with their default.
-  for (const id of SIDEBAR_NAV_ITEM_IDS) {
-    if (!seen.has(id)) items.push({ id, pinned: SIDEBAR_NAV_DEFAULT_PINNED[id] });
-  }
+  // Ids added after the payload was written land after their predecessor in the default order
+  // (or at the end), with their default pin.
+  SIDEBAR_NAV_ITEM_IDS.forEach((id, i) => {
+    if (seen.has(id)) return;
+    const prev = i > 0 ? items.findIndex((item) => item.id === SIDEBAR_NAV_ITEM_IDS[i - 1]) : -1;
+    const entry = { id, pinned: SIDEBAR_NAV_DEFAULT_PINNED[id] };
+    if (prev >= 0) items.splice(prev + 1, 0, entry);
+    else items.push(entry);
+    seen.add(id);
+  });
   return items;
 }
 
