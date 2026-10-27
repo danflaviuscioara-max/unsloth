@@ -26,6 +26,8 @@ the quality cost with scripts/diffusion_quality.py. torch / diffusers / torchao 
 
 from __future__ import annotations
 
+import contextlib
+import os
 from typing import Any, NamedTuple, Optional
 
 from .diffusion_auto_policy import (
@@ -253,6 +255,7 @@ def quantize_text_encoders(
     family: Optional[str] = None,
     offload_active: bool = False,
     logger: Any = None,
+    seat_device: Any = None,
 ) -> TEQuantOutcome:
     """Quantise each present text encoder in place with ``mode``. Returns a ``TEQuantOutcome``
     carrying the mode applied (None when disabled, unsupported, or nothing was cast) plus WHY it
@@ -306,7 +309,10 @@ def quantize_text_encoders(
     elif mode == TE_QUANT_NVFP4:
         caster = _cast_nvfp4
     else:
-        caster = _cast_fp8
+
+        def caster(enc: Any, tgt: Any) -> None:
+            _cast_fp8(enc, tgt, seat_device = seat_device)
+
     cast: list[str] = []
     failed: list[str] = []
     for attr in _TEXT_ENCODER_ATTRS:
@@ -407,6 +413,37 @@ def _weight_has_zero_output_row(module: Any) -> bool:
         return False
 
 
+SEAT_CAST_ENV = "UNSLOTH_DIFFUSION_TE_SEAT_CAST"
+
+
+@contextlib.contextmanager
+def _cast_on_device(device: Any):
+    """Inside, each layer diffusers casts to fp8 storage moves to ``device`` first and is cast THERE.
+
+    Cast on the host, a dense encoder is held twice at the peak (the bf16 source and the whole fp8 copy) and then once
+    more on the card after placement; on Windows the card's memory is charged to the same commit limit, so an 8 GB
+    encoder dipped the free commit by ~8 GB. Cast per layer on the card, only one layer is ever doubled and the fp8
+    copy is born where it will run. Only for a placement that keeps the encoder resident (the caller passes the device
+    then, else None = the stock host cast). Kill switch ``UNSLOTH_DIFFUSION_TE_SEAT_CAST=0``."""
+    if device is None or str(os.environ.get(SEAT_CAST_ENV, "1")).strip().lower() in ("0", "off", "false", "no"):
+        yield
+        return
+    from diffusers.hooks import layerwise_casting as lc
+
+    original = lc.LayerwiseCastingHook.initialize_hook
+
+    def initialize_hook(self: Any, module: Any) -> Any:
+        module.to(device = device)
+        module.to(dtype = self.storage_dtype, non_blocking = self.non_blocking)
+        return module
+
+    lc.LayerwiseCastingHook.initialize_hook = initialize_hook
+    try:
+        yield
+    finally:
+        lc.LayerwiseCastingHook.initialize_hook = original
+
+
 def _cast_fp8_dynamic(encoder: Any, target: Any) -> None:
     # torchao dynamic fp8 COMPUTE, per-row (torch._scaled_mm on the fp8 cores). Unlike layerwise `fp8` the matmul stays
     # in fp8, and it is robust across encoder sizes, so only the vision tower / lm_head / T5 wo are excluded.
@@ -429,7 +466,7 @@ def _cast_fp8_dynamic(encoder: Any, target: Any) -> None:
     quantize_(encoder, _make_quant_config(TQ_FP8), filter_fn = filter_fn)
 
 
-def _cast_fp8(encoder: Any, target: Any) -> None:
+def _cast_fp8(encoder: Any, target: Any, seat_device: Any = None) -> None:
     import re
     import torch
     from diffusers.hooks import apply_layerwise_casting
@@ -467,15 +504,16 @@ def _cast_fp8(encoder: Any, target: Any) -> None:
         if tied_name:
             skip += (rf"^{re.escape(tied_name)}$",)
 
-    apply_layerwise_casting(
-        encoder,
-        storage_dtype = torch.float8_e4m3fn,
-        compute_dtype = target.dtype,
-        skip_modules_pattern = skip,
-        # Keep token-embedding tables full precision: the diffusers default only skips vision pos/patch embeds, and
-        # fp8-ing nn.Embedding puts every prompt token on the coarse fp8 grid.
-        skip_modules_classes = (torch.nn.Embedding,),
-    )
+    with _cast_on_device(seat_device):
+        apply_layerwise_casting(
+            encoder,
+            storage_dtype = torch.float8_e4m3fn,
+            compute_dtype = target.dtype,
+            skip_modules_pattern = skip,
+            # Keep token-embedding tables full precision: the diffusers default only skips vision pos/patch embeds, and
+            # fp8-ing nn.Embedding puts every prompt token on the coarse fp8 grid.
+            skip_modules_classes = (torch.nn.Embedding,),
+        )
 
     # Module.dtype reports the first floating parameter, now fp8 STORAGE, but pipelines derive tensor dtypes from it
     # (Flux2 feeds it to randn_tensor, which has no fp8 kernel). Report the compute dtype via a property shadowed on the

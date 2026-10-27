@@ -162,9 +162,7 @@ def load_plain_prequant_safetensors(
     """Read a plain-tensor prequant checkpoint without torchao; refuses subclass metadata and unlisted tensors.
 
     ``skip_names`` are validated but never read."""
-    from safetensors import safe_open
-
-    with safe_open(path, framework = "pt", device = device) as handle:
+    with _open_safetensors(path, device) as handle:
         raw = handle.metadata() or {}
         fmt = raw.get(UNSLOTH_FORMAT_KEY)
         if not fmt:
@@ -198,6 +196,124 @@ def load_plain_prequant_safetensors(
             (key[len(UNSLOTH_ROOT_PREFIX) :], handle.get_tensor(key)) for key in roots
         )
     return {"format": str(fmt), "state_dict": state_dict, "metadata": metadata}
+
+
+SAFETENSORS_MMAP_ENV = "UNSLOTH_SAFETENSORS_MMAP"
+
+
+class _MappedSafetensors:
+    """The bits of ``safe_open`` the readers here use, over a READ-ONLY mapping of the file.
+
+    ``safe_open`` maps the file copy-on-write and ``get_tensor`` copies each tensor out: on Windows the mapping alone is
+    charged in full against the commit limit (RAM + page file), every copy on top, so a 9 GB encoder costs twice that
+    before a byte reaches the GPU, and with the commit nearly spent ``safe_open`` itself fails (os error 1455). A
+    read-only view costs no commit; the OS pages it in when a weight moves to the card. The tensors are views and are
+    never written: weights are only moved or cast, which allocate."""
+
+    def __init__(self, path: str):
+        import struct
+
+        import numpy as np
+
+        with open(path, "rb") as fh:
+            (size,) = struct.unpack("<Q", fh.read(8))
+            self._header = json.loads(fh.read(size))
+        self._meta = self._header.pop("__metadata__", None) or {}
+        self._data = np.memmap(path, dtype = np.uint8, mode = "r")
+        self._start = 8 + size
+
+    def __enter__(self) -> "_MappedSafetensors":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def metadata(self) -> dict:
+        return self._meta
+
+    def keys(self) -> list:
+        return list(self._header)
+
+    def get_tensor(self, name: str) -> Any:
+        import warnings
+
+        import torch
+
+        entry = self._header[name]
+        dtype = getattr(torch, _ST_DTYPES[entry["dtype"]])
+        lo, hi = entry["data_offsets"]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # "non-writable": the view is never written to
+            raw = torch.from_numpy(self._data[self._start + lo : self._start + hi])
+        if (self._start + lo) % torch.empty((), dtype = dtype).element_size():
+            return raw.clone().view(dtype).reshape(entry["shape"])  # unaligned: a dtype view would refuse it
+        return raw.view(dtype).reshape(entry["shape"])
+
+
+    def get_slice(self, name: str) -> "_MappedSlice":
+        return _MappedSlice(self, name)
+
+
+class _MappedSlice:
+    """What ``safe_open(...).get_slice`` hands transformers: shape / dtype without reading, ``[...]`` for the view."""
+
+    def __init__(self, owner: _MappedSafetensors, name: str):
+        self._owner, self._name = owner, name
+
+    def get_shape(self) -> list:
+        return list(self._owner._header[self._name]["shape"])
+
+    def get_dtype(self) -> str:
+        return str(self._owner._header[self._name]["dtype"])
+
+    def __getitem__(self, index: Any) -> Any:
+        tensor = self._owner.get_tensor(self._name)
+        return tensor if index is Ellipsis else tensor[index]
+
+
+def install_transformers_mapped_reader(logger: Any = None) -> bool:
+    """Have transformers read CPU safetensors through the read-only mapping (``_MappedSafetensors``).
+
+    A dense text encoder loaded by ``from_pretrained`` goes through ``safe_open`` + ``get_slice``: the copy-on-write
+    mapping and the per-tensor copies cost Windows commit twice over (an 8 GB encoder took the commit to zero next to
+    a seated denoiser). Read-only views cost none; a tensor transformers casts or moves allocates as before.
+    Idempotent; ``UNSLOTH_SAFETENSORS_MMAP=0`` leaves transformers alone."""
+    if str(os.environ.get(SAFETENSORS_MMAP_ENV, "1")).strip().lower() in ("0", "off", "false", "no"):
+        return False
+    try:
+        from transformers import modeling_utils as mu
+
+        original = getattr(mu, "safe_open", None)
+        if original is None or getattr(original, "_unsloth_mapped", False):
+            return original is not None
+
+        def safe_open(filename: Any, framework: str = "pt", device: Any = "cpu", *args: Any, **kwargs: Any) -> Any:
+            if framework == "pt" and str(device) == "cpu" and not args and not kwargs:
+                try:
+                    return _MappedSafetensors(str(filename))
+                except Exception:  # noqa: BLE001 -- safetensors' own reader stays the fallback
+                    pass
+            return original(filename, framework = framework, device = device, *args, **kwargs)
+
+        safe_open._unsloth_mapped = True
+        mu.safe_open = safe_open
+        return True
+    except Exception as exc:  # noqa: BLE001 - a memory saver only
+        if logger is not None:
+            logger.warning("safetensors: mapped reader for transformers not installed: %s", exc)
+        return False
+
+
+def _open_safetensors(path: str, device: str = "cpu") -> Any:
+    """A read-only mapped reader for CPU reads (``UNSLOTH_SAFETENSORS_MMAP=0``: safetensors' own ``safe_open``)."""
+    if device == "cpu" and str(os.environ.get(SAFETENSORS_MMAP_ENV, "1")).strip().lower() not in ("0", "off", "false", "no"):
+        try:
+            return _MappedSafetensors(path)
+        except Exception:  # noqa: BLE001 -- safetensors' own reader stays the fallback
+            pass
+    from safetensors import safe_open
+
+    return safe_open(path, framework = "pt", device = device)
 
 
 def _first(value: Any) -> Any:

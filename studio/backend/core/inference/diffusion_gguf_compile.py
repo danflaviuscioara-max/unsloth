@@ -97,9 +97,51 @@ def uninstall_compiled_dequant() -> None:
     _compiled_dequant_installed = False
 
 
+_input_cast_installed = False
+
+
+def install_input_cast(logger: Any = None) -> bool:
+    """Cast a GGUFLinear's input to its compute dtype. With a LoRA on a GGUF transformer the CUDA graph can't
+    capture and the eager path feeds fp32 timesteps into bf16 dequantised weights; stock forward_native then fails
+    with a dtype mismatch. Only changes calls that would raise. Idempotent; reverted by ``uninstall_all``."""
+    global _input_cast_installed
+    if _input_cast_installed:
+        return True
+    gguf_utils = _gguf_utils()
+    cls = getattr(gguf_utils, "GGUFLinear", None) if gguf_utils is not None else None
+    if cls is None:
+        return False
+    orig = cls.forward_native
+
+    def forward_native(self, inputs):
+        dt = getattr(self, "compute_dtype", None)
+        if dt is not None and inputs.is_floating_point() and inputs.dtype != dt:
+            inputs = inputs.to(dt)
+        return orig(self, inputs)
+
+    try:
+        if apply_patch(cls, "forward_native", forward_native, force = True):
+            _input_cast_installed = True
+        return _input_cast_installed
+    except Exception as exc:  # noqa: BLE001
+        _warn(logger, "install_input_cast", exc)
+        return False
+
+
+def uninstall_input_cast() -> None:
+    global _input_cast_installed
+    if not _input_cast_installed:
+        return
+    gguf_utils = _gguf_utils()
+    if gguf_utils is not None:
+        revert_patch(gguf_utils.GGUFLinear, "forward_native")
+    _input_cast_installed = False
+
+
 def uninstall_all() -> None:
     """Uninstall the GGUF accelerator. Idempotent; safe to call on every unload."""
     uninstall_compiled_dequant()
+    uninstall_input_cast()
 
 
 def is_installed() -> bool:

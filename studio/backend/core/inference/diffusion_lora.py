@@ -442,7 +442,7 @@ def supports_lora(
     ``compiled`` does not gate them -- the bake precedes compilation by construction. The quant
     check runs BEFORE the gguf-kind check because the quant fast path keeps the PICKER kind
     ("gguf") while the effective transformer is a dense torchao build. nvfp4/mxfp8 stay
-    unsupported; GGUF-via-diffusers stays on the native engine for LoRA.
+    unsupported; a GGUF transformer takes adapters at generation time (PEFT over GGUFLinear).
     """
     fam = (family or "").lower()
     if engine == "sd_cpp":
@@ -452,8 +452,8 @@ def supports_lora(
         return True  # load-time bake; adapters ride inside the compiled quantized build
     if quant in _DIFFUSERS_LORA_BLOCKED_QUANT:
         return False
-    if model_kind == "gguf":
-        return False  # GGUF diffusers transformer: use the native engine for LoRA
+    # GGUF-via-diffusers: GGUFLinear is an nn.Linear, so PEFT wraps it and the adapter rides on the dequantised
+    # base output at generation time, like bf16.
     if compiled:
         return False  # can't load an adapter onto an already-compiled transformer
     return True

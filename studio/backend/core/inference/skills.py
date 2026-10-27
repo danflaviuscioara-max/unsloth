@@ -497,6 +497,11 @@ def _candidate_dirs(root: Path) -> list[Path]:
         try:
             if not candidate.is_dir() and not _is_linked_path(candidate):
                 continue
+            # A folder of folders with no SKILL.md is a container (e.g. a tool's own `synced` skills), not a skill.
+            if not _is_linked_path(candidate) and not (candidate / "SKILL.md").exists() and not any(
+                c.is_file() and not c.name.startswith(".") for c in candidate.iterdir()
+            ):
+                continue
         except OSError:
             continue
         visible.append(candidate)

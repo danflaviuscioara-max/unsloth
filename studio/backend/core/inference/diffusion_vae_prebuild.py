@@ -22,6 +22,8 @@ _FALSE = ("0", "false", "no", "off")
 _LATENT_SIDE = 64
 # Free VRAM needed after the load before a second CUDA context opens.
 _MIN_FREE_BYTES = 6 * 1024**3
+# Free Windows commit (RAM + page file) the child needs beside the parent's render.
+_MIN_FREE_COMMIT_MIB = 8 * 1024
 _CHILD_TIMEOUT_S = 180.0
 _LIVE: set = set()
 _LIVE_LOCK = threading.Lock()
@@ -98,6 +100,15 @@ def maybe_kick(
             return False
         free, _total = torch.cuda.mem_get_info(job["device"])
         if free < _MIN_FREE_BYTES:
+            return False
+        from .diffusion_memory import _windows_free_commit_mib
+
+        commit = _windows_free_commit_mib()
+        if commit is not None and commit < _MIN_FREE_COMMIT_MIB:
+            # the child is a whole second torch + CUDA process (~4.6 GB committed seen); on Windows that commit is
+            # what the parent's render runs out of
+            if logger is not None:
+                logger.info("diffusion.vae_prebuild: skipped (%d MiB free commit)", commit)
             return False
         return _spawn(job, logger)
     except Exception as exc:  # noqa: BLE001 - a prebuild, never a failed load

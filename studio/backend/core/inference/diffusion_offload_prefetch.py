@@ -46,6 +46,15 @@ def prefetch_depth() -> int:
     return max(1, min(MAX_PREFETCH_DEPTH, depth))
 
 
+def _pinning_off() -> bool:
+    """``UNSLOTH_DIFFUSION_GROUP_OFFLOAD_PIN=0`` (Hive's default on Windows): copy straight from the host tensors.
+
+    A per-copy ``pin_memory()`` makes a pinned duplicate of every streamed group each step, and torch's host allocator
+    keeps them cached: a Qwen-Image 2.1 render with 14 streamed groups grew the process by ~5 GB of committed memory,
+    which on Windows is the same limit the GPU's memory is charged to."""
+    return (os.environ.get("UNSLOTH_DIFFUSION_GROUP_OFFLOAD_PIN") or "").strip().lower() in ("0", "off", "false", "no")
+
+
 def _go() -> Any:
     from diffusers.hooks import group_offloading as go
     return go
@@ -216,7 +225,7 @@ class GroupPrefetcher:
         with torch.cuda.stream(stream):
             for t in _group_tensors(group):
                 src = cpu[t]
-                if not src.is_pinned():
+                if not src.is_pinned() and not _pinning_off():
                     src = (
                         src.pin_memory()
                     )  # diffusers' low_cpu_mem_usage path: the host allocator fences reuse

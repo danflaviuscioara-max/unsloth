@@ -3014,7 +3014,83 @@ def _pin_budget_mib() -> Optional[int]:
     if limit is not None:
         total = min(int(total), int(limit))
     reserve = max(_PIN_RESERVE_MIN_MIB, int(int(total) * _PIN_RESERVE_FRACTION))
-    return max(0, int(available) - reserve)
+    budget = max(0, int(available) - reserve)
+    commit = _windows_free_commit_mib()
+    if commit is not None:
+        # Pinned pages are committed; on Windows so is every GPU allocation, and running out is a native crash.
+        budget = min(budget, max(0, commit - _PIN_RESERVE_MIN_MIB))
+    return budget
+
+
+_NO_PIN_ATTR = "_unsloth_no_pin"
+
+
+def _stream_unpinned(module: Any, logger: Any = None) -> int:
+    """Mark ``module``'s offload groups to copy straight from their host tensors, never through a pinned copy.
+
+    An unpinned stream (``low_cpu_mem_usage``) still pins each group on every onload (``_pinned_memory_tensors``), and
+    torch's host allocator keeps those buffers cached: one encode of a streamed 9 GB encoder left 4.6 GB pinned. Pinned
+    pages are committed, and on Windows the commit limit is what runs out. A pageable host-to-device copy of a weight
+    read from a file mapping costs nothing to commit and is only slower in a pass that runs once per prompt. Returns
+    how many groups were marked."""
+    marked = 0
+    try:
+        _install_no_pin_onload()
+        for sub in module.modules():
+            registry = getattr(sub, "_diffusers_hook", None)
+            hook = registry.get_hook("group_offloading") if registry is not None else None
+            group = getattr(hook, "group", None)
+            if group is not None and not getattr(group, _NO_PIN_ATTR, False):
+                setattr(group, _NO_PIN_ATTR, True)
+                marked += 1
+    except Exception as exc:  # noqa: BLE001 -- the stock pinned transfer stays
+        if logger is not None:
+            logger.warning("diffusion.memory: unpinned encoder stream not set up: %s", exc)
+    return marked
+
+
+def _install_no_pin_onload() -> None:
+    from contextlib import contextmanager
+
+    from diffusers.hooks import group_offloading as go
+
+    original = go.ModuleGroup._pinned_memory_tensors
+    if getattr(original, "_unsloth_no_pin", False):
+        return
+
+    @contextmanager
+    def _pinned_memory_tensors(self: Any):
+        # Marked groups, and on Windows every group set up without up-front pins: a per-onload pin there is commit the
+        # render may not have (a picture edit's vision-tower group hit "CUDA error: out of memory" pinning at 0.9 GB)
+        if getattr(self, _NO_PIN_ATTR, False) or (sys.platform == "win32" and getattr(self, "low_cpu_mem_usage", False)):
+            yield self.cpu_param_dict
+            return
+        with original(self) as pinned:
+            yield pinned
+
+    _pinned_memory_tensors._unsloth_no_pin = True
+    go.ModuleGroup._pinned_memory_tensors = _pinned_memory_tensors
+
+
+def _windows_free_commit_mib() -> Optional[int]:
+    """What Windows can still commit (RAM + page file) in MiB, else None (other systems)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _Status(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                (n, ctypes.c_ulonglong) for n in ("tp", "ap", "tpage", "apage", "tv", "av", "ae")
+            ]
+
+        st = _Status()
+        st.length = ctypes.sizeof(_Status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return None
+        return int(st.apage) // (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _remove_group_offload_hooks(module: Any) -> None:
@@ -3899,6 +3975,11 @@ def _apply_group_offload(
                 logger,
             )
             gkwargs["low_cpu_mem_usage"] = not pin_streamed[0]
+        if str(os.environ.get(GROUP_OFFLOAD_PIN_ENV, "")).strip().lower() in ("0", "off", "false", "no") and "low_cpu_mem_usage" in _params:
+            # pinning switched off: every tier streams unpinned (only the streamed-encoder tier read the switch, so a
+            # streamed denoiser still pinned its whole host copy up front)
+            pin_streamed = (False, False)
+            gkwargs["low_cpu_mem_usage"] = True
         if getattr(pipe, "_unsloth_small_host", None) and "low_cpu_mem_usage" in _params:
             # pinning would copy the small-host route's memory-mapped bytes back into host RAM
             pin_streamed = (False, False)
@@ -3975,6 +4056,8 @@ def _apply_group_offload(
                     _defer_pinning(pipe, module, onload, logger)
                 else:
                     apply_group_offloading(module, **ekwargs)
+                    if ekwargs.get("low_cpu_mem_usage"):
+                        _stream_unpinned(module, logger)
                 installed += 1
                 _pin_vision_embedding_device(module)
                 if te_room > 0:

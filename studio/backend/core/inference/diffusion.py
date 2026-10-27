@@ -1324,6 +1324,52 @@ def _qwen_image_21_checkpoint_to_diffusers(checkpoint = None, **kwargs):
     return converted
 
 
+def _split_qwen21_lora_gate_up(state_dict: dict) -> dict:
+    """A Qwen-Image-2.1 LoRA trained on the original layout targets the FUSED ``img_mlp.gate_up`` [24576, in]; the
+    diffusers model has ``gate_layer`` and ``proj`` [12288, in] apart (see ``_qwen_image_21_checkpoint_to_diffusers``:
+    gate first, then proj). The shared input side (``lora_A``) goes to both, the output side (``lora_B``) is split by
+    rows the same way; without this diffusers drops those keys as unexpected and the LoRA's MLP half is lost."""
+    if not any(".img_mlp.gate_up." in k for k in state_dict):
+        return state_dict
+    out = {}
+    for key, value in state_dict.items():
+        if ".img_mlp.gate_up." not in key:
+            out[key] = value
+            continue
+        gate, proj = key.replace(".gate_up.", ".gate_layer."), key.replace(".gate_up.", ".proj.")
+        if ".lora_B." in key and getattr(value, "ndim", 0) == 2 and value.shape[0] % 2 == 0:
+            half = value.shape[0] // 2
+            out[gate], out[proj] = value[:half].contiguous(), value[half:].contiguous()
+        else:  # lora_A, alpha: the same for both halves
+            out[gate], out[proj] = value, value.clone() if hasattr(value, "clone") else value
+    return out
+
+
+def _install_qwen21_lora_split(logger: Any = None) -> None:
+    """Have the Qwen-Image LoRA loader split fused ``gate_up`` adapters (``_split_qwen21_lora_gate_up``). Idempotent."""
+    try:
+        from diffusers.loaders.lora_pipeline import QwenImageLoraLoaderMixin
+
+        original = QwenImageLoraLoaderMixin.lora_state_dict
+        if getattr(original, "_unsloth_gate_up", False):
+            return
+        func = original.__func__
+
+        def lora_state_dict(cls, *args: Any, **kwargs: Any):
+            out = func(cls, *args, **kwargs)
+            if isinstance(out, tuple):
+                return (_split_qwen21_lora_gate_up(out[0]), *out[1:])
+            return _split_qwen21_lora_gate_up(out)
+
+        wrapped = classmethod(lora_state_dict)
+        lora_state_dict._unsloth_gate_up = True
+        QwenImageLoraLoaderMixin.lora_state_dict = wrapped
+        QwenImageLoraLoaderMixin.lora_state_dict.__func__._unsloth_gate_up = True
+    except Exception as exc:  # noqa: BLE001 - a LoRA layout fix only
+        if logger is not None:
+            logger.warning("diffusion.lora: gate_up split not installed: %s", exc)
+
+
 # Transformer classes the installed diffusers cannot load from a single file, with the converter
 # that lets it. Without an entry ``from_single_file`` refuses before reading a byte ("FromOriginalModelMixin is
 # currently only compatible with ..."), and on a CUDA, ROCm or XPU host that is every GGUF load of the
@@ -1428,6 +1474,60 @@ def _install_gguf_dim_restore(logger: Any) -> None:
             sfm.load_model_dict_into_meta = _restoring_loader
     except Exception as exc:  # noqa: BLE001 - loader-compat shim only, never fail the load
         logger.warning("diffusion.gguf: dim-restore shim not installed: %s", exc)
+
+
+GGUF_MMAP_ENV = "UNSLOTH_DIFFUSION_GGUF_MMAP"
+
+
+def _install_gguf_mmap_read(logger: Any) -> None:
+    """Read GGUF tensors as views of the memory-mapped file instead of private copies.
+
+    diffusers' ``load_gguf_checkpoint`` does ``torch.from_numpy(tensor.data.copy())``: the whole file lands in private
+    host memory, which Windows charges against its commit limit (RAM + page file) until every reference drops, so a
+    7 GB GGUF beside a 9 GB text encoder exhausts a small page file mid-load (a native access violation). Views of a
+    read-only mapping are file-backed: the OS pages them in for the move to the card and can drop them again, and
+    they cost no commit. The loader only reshapes and moves these tensors (dtype casts of the F32 / F16 ones make
+    their own copies). Idempotent; kill switch ``UNSLOTH_DIFFUSION_GGUF_MMAP=0`` keeps the stock copying loader."""
+    if str(os.environ.get(GGUF_MMAP_ENV, "1")).strip().lower() in ("0", "off", "false", "no"):
+        return
+    try:
+        from diffusers.models import model_loading_utils as mlu
+
+        original = getattr(mlu, "load_gguf_checkpoint", None)
+        if original is None or getattr(original, "_unsloth_mmap", False):
+            return
+
+        def load_gguf_checkpoint(gguf_checkpoint_path: Any, return_tensors: bool = False):
+            import warnings
+
+            import gguf
+            import torch
+            from diffusers.quantizers.gguf.utils import SUPPORTED_GGUF_QUANT_TYPES, GGUFParameter
+
+            reader = gguf.GGUFReader(gguf_checkpoint_path)
+            plain = (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
+            out = {}
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # "non-writable": the view is never written to
+                for tensor in reader.tensors:
+                    quant = tensor.tensor_type
+                    is_quant = quant not in plain
+                    if is_quant and quant not in SUPPORTED_GGUF_QUANT_TYPES:
+                        return original(gguf_checkpoint_path)  # the stock loader words the refusal
+                    weights = torch.from_numpy(tensor.data)
+                    if quant == gguf.GGMLQuantizationType.BF16:
+                        # BF16 is plain bf16, not a block quant: gguf hands its raw bytes (a (4096,) norm weight as
+                        # 8192 uint8), and as a GGUFParameter a non-Linear module (an RMSNorm) would read those
+                        # bytes as values. A bf16 view of the same mapped bytes is the real tensor.
+                        out[tensor.name] = weights.view(torch.bfloat16)
+                        continue
+                    out[tensor.name] = GGUFParameter(weights, quant_type = quant) if is_quant else weights
+            return out
+
+        load_gguf_checkpoint._unsloth_mmap = True
+        mlu.load_gguf_checkpoint = load_gguf_checkpoint
+    except Exception as exc:  # noqa: BLE001 - a memory saver only, never fail the load
+        logger.warning("diffusion.gguf: memory-mapped read not installed: %s", exc)
 
 
 @functools.lru_cache(maxsize = None)
@@ -1801,6 +1901,53 @@ def _torchao_render_needs_no_grad(state: Any) -> bool:
     return bool(
         getattr(state, "transformer_quant", None) or getattr(state, "text_encoder_quant", None)
     )
+
+
+EARLY_SEAT_ENV = "UNSLOTH_DIFFUSION_EARLY_SEAT"
+
+
+def _seat_transformer_early(transformer: Any, plan: Any, target: Any, logger: Any = None) -> Any:
+    """Move a just-read denoiser to its CUDA device before the companions load, when ``plan`` keeps it resident.
+
+    Without this every component sits in host memory together until placement (a 7 GB GGUF beside a 9 GB text
+    encoder), which on a host with a small page file runs Windows out of commit mid-read: a native access violation,
+    not a Python error. Placement later finds the denoiser already seated and leaves it. Only when the card has room
+    for it now plus a margin; a failed move goes back to the host and the load carries on as before. Kill switch:
+    ``UNSLOTH_DIFFUSION_EARLY_SEAT=0``."""
+    if str(os.environ.get(EARLY_SEAT_ENV, "1")).strip().lower() in ("0", "off", "false", "no"):
+        return transformer
+    try:
+        import torch
+
+        device = getattr(target, "torch_device", None)
+        if device is None or torch.device(device).type != "cuda" or not plan_keeps_transformer_resident(plan):
+            return transformer
+        size = sum(t.numel() * t.element_size() for t in transformer.parameters()) + sum(
+            b.numel() * b.element_size() for b in transformer.buffers()
+        )
+        free, _total = torch.cuda.mem_get_info(torch.device(device))
+        if size + (1 << 30) > free:
+            return transformer
+        transformer = transformer.to(device)
+        import gc
+
+        gc.collect()
+        if logger is not None:
+            logger.info(
+                "diffusion.early_seat: denoiser (%.1f GB) on %s before the companions load", size / 1e9, device
+            )
+    except Exception as exc:  # noqa: BLE001 -- an optimisation: the load continues from the host copy
+        try:
+            transformer = transformer.to("cpu")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            clear_gpu_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        if logger is not None:
+            logger.warning("diffusion.early_seat: skipped (%s)", exc)
+    return transformer
 
 
 def _memory_request_forces_offload(memory_mode: Optional[str], cpu_offload: bool) -> bool:
@@ -6270,14 +6417,11 @@ class DiffusionBackend:
                         and normalize_transformer_quant(transformer_quant) is not None
                         and _has_active_lora(loras)
                     ):
-                        # Adapters were requested BAKED but that build failed, and the GGUF fallback cannot carry them;
-                        # fail loudly.
-                        raise RuntimeError(
-                            "The requested LoRA adapters could not be applied: baking adapters "
-                            "requires the quantized (int8/fp8) transformer build, which was "
-                            "declined or failed on this device (see the server log), and the "
-                            "GGUF fallback cannot carry them. Retry without transformer_quant "
-                            "adapters, free VRAM, or pick a smaller model."
+                        # Adapters were requested BAKED but that build failed: the GGUF fallback carries them now
+                        # (supports_lora: PEFT over GGUFLinear), attached at load or per render.
+                        logger.info(
+                            "diffusion.lora: the quantized build for baking adapters was declined; "
+                            "the GGUF carries them instead"
                         )
 
                     # GGUF reaches its verdict here; pipeline quantisation is attempted after assembly.
@@ -6550,11 +6694,20 @@ class DiffusionBackend:
                                 # choke.
                                 _install_gguf_prefix_strip(transformer_cls, logger)
                                 _install_gguf_dim_restore(logger)
+                                _install_gguf_mmap_read(logger)
+                                _install_qwen21_lora_split(logger)
+                                from .prequant_safetensors import install_transformers_mapped_reader
+
+                                install_transformers_mapped_reader(logger)
                             # A safetensors single-file (fp8) carries its own dtype: no GGUF dequant config.
                             transformer = transformer_cls.from_single_file(
                                 single_file_path, **sf_kwargs
                             )
                             self._raise_if_load_cancelled(_load_token)
+                            # Seat the denoiser on the card now when the plan keeps it there, so host RAM holds only
+                            # the companions read next instead of every component at once.
+                            if kind == "gguf":
+                                transformer = _seat_transformer_early(transformer, plan, target, logger)
 
                             if fam.name == KREA2_FAMILY_NAME:
                                 pipe = load_krea2_pipeline(
@@ -7142,6 +7295,13 @@ class DiffusionBackend:
                         family = fam.name,
                         offload_active = plan.offload_policy != OFFLOAD_NONE,
                         logger = logger,
+                        # a resident placement: cast each layer on the card instead of the whole encoder in host RAM
+                        seat_device = (
+                            target.torch_device
+                            if plan.offload_policy == OFFLOAD_NONE
+                            and str(getattr(target, "torch_device", "")).startswith("cuda")
+                            else None
+                        ),
                     )
                     self._raise_if_load_cancelled(_load_token)
                     te_quant = te_outcome.mode
@@ -9014,6 +9174,10 @@ class DiffusionBackend:
             cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
             raise ValueError(f"Failed to apply LoRA: {exc}") from exc
         pipe._unsloth_loras = desired
+        if state.kind == "gguf":
+            from .diffusion_gguf_compile import install_input_cast
+
+            install_input_cast(logger)
         # load_lora_weights can re-materialise parameters the graphs baked pointers to.
         cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
 

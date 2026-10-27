@@ -587,11 +587,11 @@ def _safetensors_te_class(path: str) -> Optional[str]:
     try:
         import json
 
-        from safetensors import safe_open
+        from .prequant_safetensors import _open_safetensors as safe_open_ro
 
         from .prequant_safetensors import UNSLOTH_METADATA_KEY
 
-        with safe_open(path, framework = "pt", device = "cpu") as handle:
+        with safe_open_ro(path, "cpu") as handle:
             raw = handle.metadata() or {}
         metadata = json.loads(raw.get(UNSLOTH_METADATA_KEY) or "{}")
         value = metadata.get("te_class") if isinstance(metadata, dict) else None
@@ -601,8 +601,9 @@ def _safetensors_te_class(path: str) -> Optional[str]:
 
 
 def _read_safetensors_tensor(path: str, name: str) -> Any:
-    from safetensors import safe_open
-    with safe_open(path, framework = "pt", device = "cpu") as handle:
+    from .prequant_safetensors import _open_safetensors
+
+    with _open_safetensors(path, "cpu") as handle:
         return handle.get_tensor(name)
 
 
